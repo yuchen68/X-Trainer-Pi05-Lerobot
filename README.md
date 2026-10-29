@@ -224,7 +224,110 @@ python scripts/xtrainer/train_pi05.py \
 当前未提供 Pi05 专用 LoRA 训练与合并脚本。LoRA 只训练少量新增参数，
 其独立适配器不能直接交给本项目真机服务。
 
-## 7. 断点续训与检查点
+## 7. 冻结主干训练：只训动作专家
+
+第 6 节默认是全参数微调。显存紧张或数据量还小时，可以先冻结视觉语言主干、
+只训练动作专家，等数据补足再解冻。
+
+Pi05 由两部分组成：视觉语言主干（看画面、读任务描述）和动作专家
+（默认 `gemma_300m`，可切 `gemma_2b`）。冻结主干后，视觉编码器和语言部分
+一起冻住，梯度只回传到动作专家和两端的投影层。
+
+### 7.1 新建一份训练配置
+
+复制默认配置，保留原文件不动：
+
+```bash
+cp configs/xtrainer/train_pi05.yaml configs/xtrainer/train_pi05_expert_only.yaml
+```
+
+在 `configs/xtrainer/train_pi05_expert_only.yaml` 的 `policy` 段里改两行：
+
+```yaml
+policy:
+  type: pi05
+  # ... 其余保持不变 ...
+  train_expert_only: true      # 冻结整个视觉语言主干，只训动作专家与投影层
+  optimizer_lr: 1.0e-4         # 可训练参数变少，学习率一般可以抬高
+```
+
+### 7.2 给训练脚本加一个 --config 参数（两处改动）
+
+`scripts/xtrainer/train_pi05.py` 目前把配置路径写死在代码里，需要改两处才能
+切换到新配置。其余逻辑不动。
+
+第一处，在 `main()` 的参数列表里，`--repo-id` 那行之后加两行：
+
+```python
+    parser.add_argument("--repo-id", default="xtrainer/pi05")
++   parser.add_argument("--config",
++                       default=str(ROOT / "configs/xtrainer/train_pi05.yaml"))
+```
+
+第二处，在 `build_command()` 里把写死的路径换成参数（约第 37 行）：
+
+```python
+-                   f"--config_path={ROOT / 'configs/xtrainer/train_pi05.yaml'}",
++                   f"--config_path={args.config}",
+```
+
+改完后：不传 `--config` 时仍读默认配置，行为与改动前完全一致；传了就按给定
+路径读取。
+
+### 7.3 确认改动生效
+
+```bash
+python scripts/xtrainer/train_pi05.py --help          # 应能看到 --config
+python scripts/xtrainer/train_pi05.py \
+  --dataset-root /data/xtrainer/dataset_v3 \
+  --config configs/xtrainer/train_pi05_expert_only.yaml --dry-run
+```
+
+`--dry-run` 打印出来的命令里，`--config_path` 应指向
+`configs/xtrainer/train_pi05_expert_only.yaml`。
+
+### 7.4 训练
+
+先跑少量步数确认数据、权重与链路可用：
+
+```bash
+python scripts/xtrainer/train_pi05.py \
+  --dataset-root /data/xtrainer/dataset_v3 \
+  --config configs/xtrainer/train_pi05_expert_only.yaml \
+  --batch-size 8 --steps 50 --output-dir outputs/train/pi05_expert_smoke
+```
+
+`loss` 稳定下降后再延长步数：
+
+```bash
+python scripts/xtrainer/train_pi05.py \
+  --dataset-root /data/xtrainer/dataset_v3 \
+  --config configs/xtrainer/train_pi05_expert_only.yaml \
+  --batch-size 8 --steps 3000 --output-dir outputs/train/pi05_expert
+```
+
+batch size 从 8 起试，显存不够就降到 4 或 2；冻结后通常比全参能吃更大的 batch。
+
+### 7.5 三个注意事项
+
+1. `use_policy_training_preset` 为 `true` 时会套用官方训练预设，配置里自定义的
+   `optimizer_lr` 可能被覆盖。改学习率时把它设为 `false`，并显式给出
+   `optimizer_lr`、`optimizer_weight_decay` 等参数。
+
+2. 冻结训练产出的检查点里，主干与基座同源。部署时 `--checkpoint` 指向微调
+   产物，但要保证其主干与 `models/pi05-base` 是同一份，否则会报加载不匹配。
+
+3. 冻结不等于跳过数据校验。第 6 节开头的元信息检查（v3.0、14 维状态与动作、
+   三路相机、q01/q99 统计量）仍会先执行，数据不合格训练起不来。
+
+### 7.6 怎么确认主干真的冻住了
+
+训练启动后日志会打印可训练参数数量。冻结主干时应比全参微调小一个量级左右；
+若两者接近，说明开关没生效（最常见原因是改了配置却仍在读默认 yaml，用
+7.3 的 `--dry-run` 核对即可）。
+
+
+## 8. 断点续训与检查点
 
 ```bash
 python scripts/xtrainer/train_pi05.py \
@@ -239,7 +342,7 @@ python scripts/xtrainer/train_pi05.py \
 以及它们引用的归一化参数文件。迁移检查点时还需迁移 tokenizer，
 并保证流水线中记录的本地 tokenizer 路径可访问。
 
-## 8. 策略服务
+## 9. 策略服务
 
 在 GPU 机器运行：
 
@@ -272,7 +375,7 @@ python scripts/xtrainer/serve_mock_policy.py --host 0.0.0.0 --port 8000
 模拟策略重复输入的关节状态，不加载 Pi05 权重。
 通信协议为 X-Trainer 的 WebSocket + MessagePack，只适用于可信局域网，无认证与 TLS。
 
-## 9. 真机客户端
+## 10. 真机客户端
 
 在连接机器人的控制机上使用已安装依赖的环境运行：
 
@@ -300,7 +403,7 @@ IP、串口与相机参数由客户端命令行设置，服务端配置不控制
 可用 `--max-joint-delta`、`--max-gripper-delta` 等显式设置限制。
 实际执行前清空机械臂工作区并确认急停可用。
 
-## 10. 排查与验证范围
+## 11. 排查与验证范围
 
 | 问题 | 检查 |
 | --- | --- |
@@ -323,7 +426,7 @@ python -m pytest tests/xtrainer -q
 环境安装脚本与下载工具提供预演模式；Linux 完整安装、整套权重下载、
 真实 v3 写入、GPU 训练与真机表现仍需在目标环境验收。
 
-## 11. 来源与许可证
+## 12. 来源与许可证
 
 - [LeRobot](https://github.com/huggingface/lerobot)：Pi05、数据集与训练框架；
   初始基线 `3991580a5673f5f0219a4e8835a5f973eeccf9a7`。
